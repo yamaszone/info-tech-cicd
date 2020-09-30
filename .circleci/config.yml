@@ -1,0 +1,220 @@
+version: 2.1
+orbs:
+  slack: circleci/slack@2.0.0
+
+workflows:
+  version: 2.1
+  build-test-&-deploy:
+    jobs:
+      - build-node-app
+      - setup-heroku-environment:
+          filters:
+            branches:
+              only:
+                - master
+      - code-linting:
+          requires:
+            - build-node-app
+      - code-coverage:
+          requires:
+            - build-node-app
+      - vulnerability-scans:
+          requires:
+            - build-node-app
+      - build-docker-image:
+          requires:
+            - code-coverage
+            - vulnerability-scans
+      - run-integration-tests:
+          requires:
+            - build-docker-image
+      - browser-tests:
+          requires:
+            - build-docker-image
+      - approve-deployment:
+          type: approval
+          requires:
+            - browser-tests
+            - run-integration-tests
+            - setup-heroku-environment
+            - build-docker-image
+          filters:
+            branches:
+              only:
+                - master
+      - deploy-application:
+          requires:
+            - approve-deployment
+          filters:
+            branches:
+              only:
+                - master
+          context: NODE-demo
+
+jobs:
+  setup-heroku-environment:
+    working_directory: ~/project
+    machine: true
+    steps:
+    - checkout
+    - run:
+        name: Provision Heroku Dyno
+        command: chmod +x scripts/provision_heroku.sh && scripts/provision_heroku.sh
+
+  build-node-app:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    steps:
+    - checkout
+    - run:
+        name: Update NPM
+        command: 'sudo npm install -g npm@latest'
+    - restore_cache:
+        keys:
+          # when lock file changes, use increasingly general patterns to restore cache
+          - node-v1-{{ .Branch }}-{{ checksum "package-lock.json" }}
+          - node-v1-{{ .Branch }}-
+          - node-v1-
+    - run:
+        name: Fetch dependencies
+        command: npm install
+    - save_cache:
+        paths:
+          - node_modules  # location depends on npm version
+        key: node-v1-{{ .Branch }}-{{ checksum "package-lock.json" }}
+    - run: mkdir ~/junit
+    - run:
+        name: Test application - leverage test splitting across multiple nodes
+        command: npm test
+        when: always
+    - run:
+        command: cp test-results.xml ~/junit/
+        when: always
+    - store_test_results:
+          path: ~/junit
+    - store_artifacts:
+          path: ~/junit
+  
+  code-linting:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    steps:
+    - checkout
+  
+  code-coverage:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    steps:
+    - checkout
+  
+  vulnerability-scans:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    steps:
+    - checkout
+
+  build-docker-image:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    steps:
+    - checkout  
+    - setup_remote_docker
+    # these cached dependencies
+    - restore_cache:
+        keys:
+          # when lock file changes, use increasingly general patterns to restore cache
+          - node-v1-{{ .Branch }}-{{ checksum "package-lock.json" }}
+          - node-v1-{{ .Branch }}-
+          - node-v1-
+    - run:
+        name: Fetch dependencies
+        command: npm install
+    - run:
+        name: Populate Metadata
+        command: env | grep -i circle > env
+    - run:
+        name: Verify Metadata
+        command: cat env
+    - run:
+        name: Build Docker Image
+        command: docker build -t registry.heroku.com/damp-bastion-21277/web:${CIRCLE_SHA1} --build-arg CIRCLE_SHA1=$CIRCLE_SHA1 --build-arg CIRCLE_BUILD_URL=$CIRCLE_BUILD_URL .
+    - run:
+        name: Export Docker image as tar file
+        command: docker save registry.heroku.com/damp-bastion-21277/web:${CIRCLE_SHA1} > image.tar
+    - persist_to_workspace:
+          root: ~/project
+          paths:
+            - image.tar
+
+  run-integration-tests:
+    working_directory: ~/project
+    machine: true
+    steps:
+    - checkout
+    - attach_workspace:
+          at: ~/project
+    - run:
+        name: Load Docker image from tar file
+        command: docker load --input image.tar
+    - run:
+        name: Start Docker Image
+        command: docker run -p 3000:3000 registry.heroku.com/damp-bastion-21277/web:${CIRCLE_SHA1}
+        background: true
+    - run:
+        name: Run Integration Tests
+        command: |
+          curl localhost:3000/
+          docker kill $(docker ps -q)
+  
+  browser-tests:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    steps:
+    - checkout
+    - run:
+        name: Run Browser Tests
+        command: sleep 60
+
+  deploy-application:
+    working_directory: ~/project
+    docker:
+    - image: circleci/node:10.16.3
+    resource_class: small
+    steps:
+    - setup_remote_docker
+    - checkout
+    - attach_workspace:
+          at: ~/project
+    - run:
+        name: Provision Heroku Dyno
+        command: echo "Deploying appication"
+    - run:
+        name: setup heroku cli
+        command: |
+          chmod +x scripts/setup_herokucli.sh && scripts/setup_herokucli.sh
+    - run:
+        name: Update NPM
+        command: 'sudo npm install -g npm@latest'
+    - run:
+        name: Fetch dependencies
+        command: npm install
+    - run:
+        name: Load Docker image from tar file
+        command: docker load --input image.tar
+    - run:
+        name: Build and Tag Docker Image
+        command: |
+          docker push registry.heroku.com/damp-bastion-21277/web:${CIRCLE_SHA1}
+    - run:
+        name: Deploy Application
+        command: chmod +x scripts/deploy.sh && scripts/deploy.sh
+    - slack/notify:
+          mentions: 'chris'
+          webhook: ${SLACK_WEBHOOK}
+          message: ":fullyoperational: Pipeline: $CIRCLE_WORKFLOW_ID was successful! \n$CIRCLE_BUILD_URL \nhttps://damp-bastion-21277.herokuapp.com/"
