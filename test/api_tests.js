@@ -40,7 +40,7 @@ describe("Testing API", () => {
       .get("/version")
       .end((err, res) => {
         expect(res).to.have.status(200);
-        expect(res.body.VERSION).to.equals("-1");
+        expect(res.body.VERSION).to.equals("1.0");
         done();
       });
   });
